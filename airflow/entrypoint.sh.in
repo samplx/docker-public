@@ -1,0 +1,169 @@
+#!/bin/bash
+
+AIRFLOW_HOME="@AIRFLOW_HOME@"
+AIRFLOW_DAGS="@AIRFLOW_DAGS@"
+AIRFLOW_LOGS="@AIRFLOW_LOGS@"
+
+AIRFLOW_AUTHENTICATE="@AIRFLOW_AUTHENTICATE@"
+AIRFLOW_AUTH_BACKEND="@AIRFLOW_AUTH_BACKEND@"
+AIRFLOW_DAGS_REPO="@AIRFLOW_DAGS_REPO@"
+AIRFLOW_DAGS_REVISION="@AIRFLOW_DAGS_REVISION@"
+AIRFLOW_EXECUTOR="@AIRFLOW_EXECUTOR@"
+AIRFLOW_HOST="@AIRFLOW_HOST@"
+AIRFLOW_LOAD_EXAMPLES="@AIRFLOW_LOAD_EXAMPLES@"
+AIRFLOW_PASSWORD="@AIRFLOW_PASSWORD@"
+AIRFLOW_PORT="@AIRFLOW_PORT@"
+AIRFLOW_S3_LOG="@AIRFLOW_S3_LOG@"
+AIRFLOW_S3_ENCRYPT="@AIRFLOW_S3_ENCRYPT@"
+AIRFLOW_WORKER_PORT="@AIRFLOW_WORKER_PORT@"
+
+FERNET_KEY=${AIRFLOW_FERNET_KEY:=$(python -c "from cryptography.fernet import Fernet; FERNET_KEY = Fernet.generate_key().decode(); print FERNET_KEY")}
+
+DATABASE_HOST="@DATABASE_HOST@"
+DATABASE_NAME="@DATABASE_NAME@"
+DATABASE_PASSWORD="@DATABASE_PASSWORD@"
+DATABASE_PORT="@DATABASE_PORT@"
+DATABASE_TYPE="@DATABASE_TYPE@"
+DATABASE_USER="@DATABASE_USER@"
+
+FLOWER_PORT="@FLOWER_PORT@"
+
+LDAP_URI="@LDAP_URI"
+
+REDIS_HOST="@REDIS_HOST@"
+REDIS_PORT="@REDIS_PORT@"
+
+RETRY_MAX_COUNT="10"
+RETRY_WAIT_SECONDS="5"
+
+function awaitConnection() {
+    local count=0
+    local type="$1"
+    local host="$2"
+    local port="$3"
+    while ! nc -z "$host" "$port" > /dev/null 2>&1 < /dev/null
+    do
+        count=$((count+1))
+        if [ "$count" -ge "$RETRY_MAX_COUNT" ]
+        then
+            echo "$(date) ${type} ${host}:${port} failed after ${RETRY_MAX_COUNT} tries."
+            exit 1
+        fi
+        echo "$(date) ${type} ${host}:${port} connection failed... ${count}/${RETRY_MAX_COUNT}"
+        sleep "$RETRY_WAIT_SECONDS"
+    done
+}
+
+function awaitDatabase() {
+    awaitConnection "Database" "$DATABASE_HOST" "$DATABASE_PORT"
+}
+
+function awaitRedis() {
+    awaitConnection "Redis" "$REDIS_HOST" "$REDIS_PORT"
+}
+
+function createConfig() {
+    local db_url="${DATABASE_TYPE}://${DATABASE_USER}:${DATABASE_PASSWORD}@${DATABASE_HOST}:${DATABASE_PORT}/${DATABASE_NAME}"
+
+    if [ "$AIRFLOW_EXECUTOR"x = "SequentialExecutor"x ]
+    then
+        db_url="sqlite:///${AIRFLOW_HOME}/airflow.db"
+    fi
+
+    if [ "$AIRFLOW_PASSWORD"x = "x" ]
+    then
+        AIRFLOW_PASSWORD=$(pwmake 128 2>/dev/null)
+        if [ "$AIRFLOW_PASSWORD"x = "x" ]
+        then
+            echo "Unable to generate a random password for airflow."
+        else
+            echo "Generated airflow password='${AIRFLOW_PASSWORD}'"
+            echo airflow > /tmp/pw.$$
+            echo "$AIRFLOW_PASSWORD" >> /tmp/pw.$$
+            echo "$AIRFLOW_PASSWORD" >> /tmp/pw.$$
+            cat /tmp/pw.$$ | passwd -q
+            rm -f /tmp/pw.$$
+        fi
+    fi
+
+    rm -f "${AIRFLOW_HOME}/airflow.cfg"
+    sed \
+        -e "s|\$AIRFLOW_HOME|$AIRFLOW_HOME|" \
+        -e "s|\$AIRFLOW_DAGS|$AIRFLOW_DAGS|" \
+        -e "s|\$AIRFLOW_LOGS|$AIRFLOW_LOGS|" \
+        -e "s|\$AIRFLOW_AUTHENTICATE|$AIRFLOW_AUTHENTICATE|" \
+        -e "s|\$AIRFLOW_AUTH_BACKEND|$AIRFLOW_AUTH_BACKEND|" \
+        -e "s|\$AIRFLOW_EXECUTOR|$AIRFLOW_EXECUTOR|" \
+        -e "s|\$AIRFLOW_HOST|$AIRFLOW_HOST|" \
+        -e "s|\$AIRFLOW_LOAD_EXAMPLES|$AIRFLOW_LOAD_EXAMPLES|" \
+        -e "s|\$AIRFLOW_PASSWORD|$AIRFLOW_PASSWORD|" \
+        -e "s|\$AIRFLOW_PORT|$AIRFLOW_PORT|" \
+        -e "s|\$AIRFLOW_S3_LOG|$AIRFLOW_S3_LOG|" \
+        -e "s|\$AIRFLOW_S3_ENCRYPT|$AIRFLOW_S3_ENCRYPT|" \
+        -e "s|\$AIRFLOW_WORKER_PORT|$AIRFLOW_WORKER_PORT|" \
+        -e "s|\$DB_URL|$db_url|" \
+        -e "s|\$FERNET_KEY|$FERNET_KEY|" \
+        -e "s|\$LDAP_URI|$LDAP_URI|" \
+        -e "s|\$REDIS_HOST|$REDIS_HOST|" \
+        -e "s|\$REDIS_PORT|$REDIS_PORT|" \
+        < "${AIRFLOW_HOME}/airflow.cfg.in" > "${AIRFLOW_HOME}/airflow.cfg"
+
+}
+
+function setupDags() {
+    if [ "$AIRFLOW_DAGS_REPO"x != "x" ]
+    then
+        if [ ! -d "$AIRFLOW_DAGS/.git" ]
+        then
+            echo "Setup dags in $AIRFLOW_DAGS"
+            git clone "$AIRFLOW_DAGS_REPO" "$AIRFLOW_DAGS"
+        fi
+        (cd "$AIRFLOW_DAGS"; git checkout "$AIRFLOW_DAGS_REVISION")
+    fi
+}
+
+function runSequential() {
+    createConfig    
+    setupDags
+    airflow initdb
+    sleep 5
+    exec airflow webserver
+}
+
+function runCelery() {
+    awaitDatabase
+    awaitRedis
+    createConfig
+    setupDags
+    exec airflow "$@"
+}
+
+function runLocal() {
+    awaitDatabase
+    createConfig
+    setupDags
+    exec airflow "$@"
+}
+
+if [ "$1"x == "version"x ]
+then
+    exec airflow version
+elif [ "$1"x == "bash"x ]
+then
+    exec /bin/bash
+fi
+
+case "$AIRFLOW_EXECUTOR" in
+    SequentialExecutor)
+        runSequential $@
+        ;;
+    LocalExecutor)
+        runLocal "$@"
+        ;;
+    CeleryExecutor)
+        runCelery "$@"
+        ;;
+    *)
+        exec airflow "$@"
+        ;;
+esac
